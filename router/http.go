@@ -149,6 +149,26 @@ func (s *HTTPListener) RemoveRoute(id string) error {
 	return s.ds.Remove(id)
 }
 
+func (s *HTTPListener) AddDrainListener(routeID string, ch chan string) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	r := s.routes[routeID]
+	srv := s.services[r.Service]
+	srv.listenMtx.Lock()
+	srv.listeners[ch] = struct{}{}
+	srv.listenMtx.Unlock()
+}
+
+func (s *HTTPListener) RemoveDrainListener(routeID string, ch chan string) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	r := s.routes[routeID]
+	srv := s.services[r.Service]
+	srv.listenMtx.Lock()
+	delete(srv.listeners, ch)
+	srv.listenMtx.Unlock()
+}
+
 type httpSyncHandler struct {
 	l *HTTPListener
 }
@@ -193,7 +213,14 @@ func (h *httpSyncHandler) Set(data *router.Route) error {
 		if err != nil {
 			return err
 		}
-		service = &httpService{name: r.Service, ss: ss, cookieKey: h.l.cookieKey, paused: false, requests: make(map[string]int32)}
+		service = &httpService{
+			name:      r.Service,
+			ss:        ss,
+			cookieKey: h.l.cookieKey,
+			requests:  make(map[string]int32),
+			listeners: make(map[chan string]interface{}),
+			paused:    false,
+		}
 		service.resumeCond = sync.NewCond(&service.pauseMtx)
 		h.l.services[r.Service] = service
 	}
@@ -363,6 +390,8 @@ type httpService struct {
 	cookieKey  *[32]byte
 	requests   map[string]int32
 	requestMtx sync.RWMutex
+	listeners  map[chan string]interface{}
+	listenMtx  sync.RWMutex
 
 	paused     bool
 	pauseMtx   sync.RWMutex
@@ -380,6 +409,14 @@ func (s *httpService) Unpause() {
 	s.paused = false
 	s.pauseMtx.Unlock()
 	s.resumeCond.Broadcast()
+}
+
+func (s *httpService) sendEvent(event string) {
+	s.listenMtx.RLock()
+	defer s.listenMtx.RUnlock()
+	for ch := range s.listeners {
+		ch <- event
+	}
 }
 
 func (s *httpService) getBackend() (*httputil.ClientConn, string) {
@@ -573,6 +610,19 @@ func (s *httpService) handle(req *http.Request, sc *httputil.ServerConn, tls, st
 
 	s.requestMtx.Lock()
 	s.requests[addr]--
+	if s.requests[addr] == 0 {
+		s.sendEvent(addr)
+	}
+	all := true
+	for _, n := range s.requests {
+		if n != 0 {
+			all = false
+			break
+		}
+	}
+	if all {
+		s.sendEvent("all")
+	}
 	s.requestMtx.Unlock()
 
 	return
