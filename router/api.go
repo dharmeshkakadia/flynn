@@ -11,6 +11,7 @@ import (
 	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/go-martini/martini"
 	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/martini-contrib/binding"
 	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/martini-contrib/render"
+	"github.com/flynn/flynn/pkg/sse"
 	"github.com/flynn/flynn/router/types"
 )
 
@@ -174,4 +175,40 @@ func deleteRoute(params martini.Params, router *Router, r render.Render) {
 	}
 
 	r.JSON(200, struct{}{})
+}
+
+func streamRouteDrain(req *http.Request, params martini.Params, router *Router, w http.ResponseWriter) {
+	l := listenerFor(router, params["route_type"])
+	if l == nil {
+		w.WriteHeader(404)
+		return
+	}
+
+	route, err := l.Get(params["route_id"])
+	if err == ErrNotFound {
+		w.WriteHeader(404)
+		return
+	}
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(500)
+		return
+	}
+	// TODO: write out SSE Content-Type
+	w.WriteHeader(200)
+	if wf, ok := w.(http.Flusher); ok {
+		wf.Flush()
+	}
+
+	ch := make(chan string)
+	l.AddDrainListener(route.ID, ch)
+	defer l.RemoveDrainListener(route.ID, ch)
+
+	ssew := sse.NewSSEWriter(w)
+	for event := range ch {
+		if _, err := ssew.Write([]byte(event)); err != nil {
+			return
+		}
+		ssew.Flush()
+	}
 }
