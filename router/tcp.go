@@ -104,6 +104,20 @@ func (l *TCPListener) RemoveRoute(id string) error {
 	return l.ds.Remove(id)
 }
 
+func (s *TCPListener) PauseService(id string, pause bool) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
+	port, err := strconv.Atoi(id)
+	if err != nil {
+		return err
+	}
+	service := s.serviceIDs[port]
+	service.paused = pause
+	return nil
+}
 func (s *TCPListener) AddDrainListener(serviceID string, ch chan string) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()

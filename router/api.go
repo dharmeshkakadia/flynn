@@ -29,6 +29,8 @@ func apiHandler(rtr *Router) http.Handler {
 	r.Get("/routes", getRoutes)
 	r.Get("/routes/:route_type/:route_id", getRoute)
 	r.Delete("/routes/:route_type/:route_id", deleteRoute)
+	r.Put("/services/:service_type/:service_name", pauseService)
+	r.Get("/services/:service_type/:service_name/drain", streamServiceDrain)
 	return m
 }
 
@@ -177,32 +179,46 @@ func deleteRoute(params martini.Params, router *Router, r render.Render) {
 	r.JSON(200, struct{}{})
 }
 
-func streamRouteDrain(req *http.Request, params martini.Params, router *Router, w http.ResponseWriter) {
-	l := listenerFor(router, params["route_type"])
+func pauseService(req *http.Request, params martini.Params, router *Router, r render.Render) {
+	l := listenerFor(router, params["service_type"])
+	if l == nil {
+		r.JSON(404, struct{}{})
+		return
+	}
+	pause := false
+	if req.FormValue("pause") == "true" {
+		pause = true
+	}
+	err := l.PauseService(params["service_name"], pause)
+	if err == ErrNotFound {
+		r.JSON(404, struct{}{})
+		return
+	}
+	if err != nil {
+		log.Println(err)
+		r.JSON(500, struct{}{})
+		return
+	}
+
+	r.JSON(200, struct{}{})
+}
+
+func streamServiceDrain(req *http.Request, params martini.Params, router *Router, w http.ResponseWriter) {
+	l := listenerFor(router, params["service_type"])
 	if l == nil {
 		w.WriteHeader(404)
 		return
 	}
 
-	route, err := l.Get(params["route_id"])
-	if err == ErrNotFound {
-		w.WriteHeader(404)
-		return
-	}
-	if err != nil {
-		log.Println(err)
-		w.WriteHeader(500)
-		return
-	}
-	// TODO: write out SSE Content-Type
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.WriteHeader(200)
 	if wf, ok := w.(http.Flusher); ok {
 		wf.Flush()
 	}
 
 	ch := make(chan string)
-	l.AddDrainListener(route.ID, ch)
-	defer l.RemoveDrainListener(route.ID, ch)
+	l.AddDrainListener(params["service_name"], ch)
+	defer l.RemoveDrainListener(params["service_name"], ch)
 
 	ssew := sse.NewSSEWriter(w)
 	for event := range ch {

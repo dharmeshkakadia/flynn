@@ -149,21 +149,30 @@ func (s *HTTPListener) RemoveRoute(id string) error {
 	return s.ds.Remove(id)
 }
 
-func (s *HTTPListener) AddDrainListener(routeID string, ch chan string) {
+func (s *HTTPListener) PauseService(name string, pause bool) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
+	service := s.services[name]
+	service.paused = pause
+	return nil
+}
+
+func (s *HTTPListener) AddDrainListener(name string, ch chan string) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	r := s.routes[routeID]
-	srv := s.services[r.Service]
+	srv := s.services[name]
 	srv.listenMtx.Lock()
 	srv.listeners[ch] = struct{}{}
 	srv.listenMtx.Unlock()
 }
 
-func (s *HTTPListener) RemoveDrainListener(routeID string, ch chan string) {
+func (s *HTTPListener) RemoveDrainListener(name string, ch chan string) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	r := s.routes[routeID]
-	srv := s.services[r.Service]
+	srv := s.services[name]
 	srv.listenMtx.Lock()
 	delete(srv.listeners, ch)
 	srv.listenMtx.Unlock()
