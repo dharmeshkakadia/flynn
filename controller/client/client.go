@@ -339,8 +339,12 @@ func (s *JobEventStream) Close() {
 	s.body.Close()
 }
 
-func (c *Client) StreamJobEvents(appID string) (*JobEventStream, error) {
-	res, err := c.rawReq("GET", fmt.Sprintf("/apps/%s/jobs", appID), http.Header{"Accept": []string{"text/event-stream"}}, nil, nil)
+func (c *Client) StreamJobEvents(appID string, lastID int64) (*JobEventStream, error) {
+	header := http.Header{
+		"Accept":        []string{"text/event-stream"},
+		"Last-Event-Id": []string{fmt.Sprintf("%d", lastID)},
+	}
+	res, err := c.rawReq("GET", fmt.Sprintf("/apps/%s/jobs", appID), header, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -395,6 +399,11 @@ func (c *Client) RunJobAttached(appID string, job *ct.NewJob) (utils.ReadWriteCl
 func (c *Client) RunJobDetached(appID string, req *ct.NewJob) (*ct.Job, error) {
 	job := &ct.Job{}
 	return job, c.post(fmt.Sprintf("/apps/%s/jobs", appID), req, job)
+}
+
+func (c *Client) GetJob(appID, jobID string) (*ct.Job, error) {
+	job := &ct.Job{}
+	return job, c.get(fmt.Sprintf("/apps/%s/jobs/%s", appID, jobID), job)
 }
 
 func (c *Client) JobList(appID string) ([]*ct.Job, error) {

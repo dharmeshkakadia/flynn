@@ -19,12 +19,18 @@ import (
 
 var backoffPeriod = 10 * time.Minute
 
-// Allow mocking time.AfterFunc in tests
-var timeAfterFunc = time.AfterFunc
-
 func main() {
 	grohl.AddContext("app", "controller-scheduler")
 	grohl.Log(grohl.Data{"at": "start"})
+
+	if period := os.Getenv("BACKOFF_PERIOD"); period != "" {
+		var err error
+		backoffPeriod, err = time.ParseDuration(period)
+		if err != nil {
+			log.Fatal(err)
+		}
+		grohl.Log(grohl.Data{"at": "backoff_period", "period": backoffPeriod.String()})
+	}
 
 	cc, err := controller.NewClient("", os.Getenv("AUTH_KEY"))
 	if err != nil {
@@ -45,7 +51,7 @@ func main() {
 	grohl.Log(grohl.Data{"at": "leader"})
 
 	// TODO: periodic full cluster sync for anti-entropy
-	c.watchFormations(nil, nil)
+	c.watchFormations()
 }
 
 func newContext(cc controllerClient, cl clusterClient) *context {
@@ -86,14 +92,14 @@ type controllerClient interface {
 	PutJob(job *ct.Job) error
 }
 
-func (c *context) syncCluster(events chan<- *host.Event) {
+func (c *context) syncCluster() {
 	g := grohl.NewContext(grohl.Data{"fn": "syncCluster"})
 
 	artifacts := make(map[string]*ct.Artifact)
 	releases := make(map[string]*ct.Release)
 	rectify := make(map[*Formation]struct{})
 
-	go c.watchHosts(events)
+	go c.watchHosts()
 
 	hosts, err := c.ListHosts()
 	if err != nil {
@@ -175,13 +181,10 @@ func (c *context) syncCluster(events chan<- *host.Event) {
 	}
 }
 
-func (c *context) watchFormations(events chan<- *FormationEvent, hostEvents chan<- *host.Event) {
+func (c *context) watchFormations() {
 	g := grohl.NewContext(grohl.Data{"fn": "watchFormations"})
 
-	c.syncCluster(hostEvents)
-	if events != nil {
-		events <- &FormationEvent{}
-	}
+	c.syncCluster()
 
 	var attempts int
 	var lastUpdatedAt time.Time
@@ -223,9 +226,6 @@ func (c *context) watchFormations(events chan<- *FormationEvent, hostEvents chan
 			}
 			go func() {
 				f.Rectify()
-				if events != nil {
-					events <- &FormationEvent{Formation: f}
-				}
 			}()
 		}
 		if *err != nil {
@@ -236,7 +236,7 @@ func (c *context) watchFormations(events chan<- *FormationEvent, hostEvents chan
 	}
 }
 
-func (c *context) watchHosts(events chan<- *host.Event) {
+func (c *context) watchHosts() {
 	hosts, err := c.ListHosts()
 	if err != nil {
 		// TODO: log/handle error
@@ -249,7 +249,7 @@ func (c *context) watchHosts(events chan<- *host.Event) {
 			if event.Event != "add" {
 				continue
 			}
-			go c.watchHost(event.HostID, events)
+			go c.watchHost(event.HostID)
 
 			c.omniMtx.RLock()
 			for f := range c.omni {
@@ -260,7 +260,7 @@ func (c *context) watchHosts(events chan<- *host.Event) {
 	}()
 
 	for id := range hosts {
-		go c.watchHost(id, events)
+		go c.watchHost(id)
 	}
 
 }
@@ -270,7 +270,7 @@ var putJobAttempts = attempt.Strategy{
 	Delay: 500 * time.Millisecond,
 }
 
-func (c *context) watchHost(id string, events chan<- *host.Event) {
+func (c *context) watchHost(id string) {
 	if !c.hosts.Add(id) {
 		return
 	}
@@ -289,11 +289,6 @@ func (c *context) watchHost(id string, events chan<- *host.Event) {
 	ch := make(chan *host.Event)
 	h.StreamEvents("all", ch)
 
-	// Nil event to mark the start of watching a host
-	if events != nil {
-		events <- nil
-	}
-
 	for event := range ch {
 		job := c.jobs.Get(id, event.JobID)
 		if job == nil {
@@ -301,15 +296,15 @@ func (c *context) watchHost(id string, events chan<- *host.Event) {
 		}
 
 		j := &ct.Job{ID: id + "-" + event.JobID, AppID: job.Formation.AppID, ReleaseID: job.Formation.Release.ID, Type: job.Type}
-		switch event.Event {
-		case "create":
+		switch event.Job.Status {
+		case host.StatusStarting:
 			j.State = "starting"
-		case "start":
+		case host.StatusRunning:
 			j.State = "up"
 			job.startedAt = event.Job.StartedAt
-		case "stop":
+		case host.StatusDone:
 			j.State = "down"
-		case "error":
+		case host.StatusCrashed, host.StatusFailed:
 			j.State = "crashed"
 		}
 		g.Log(grohl.Data{"at": "event", "job.id": event.JobID, "event": event.Event})
@@ -327,9 +322,6 @@ func (c *context) watchHost(id string, events chan<- *host.Event) {
 		}(event)
 
 		if event.Event != "error" && event.Event != "stop" {
-			if events != nil {
-				events <- event
-			}
 			continue
 		}
 		g.Log(grohl.Data{"at": "remove", "job.id": event.JobID, "event": event.Event})
@@ -339,9 +331,6 @@ func (c *context) watchHost(id string, events chan<- *host.Event) {
 			c.mtx.RLock()
 			job.Formation.RestartJob(job.Type, id, event.JobID)
 			c.mtx.RUnlock()
-			if events != nil {
-				events <- event
-			}
 		}(event)
 	}
 	// TODO: check error/reconnect
@@ -562,7 +551,7 @@ func (f *Formation) RestartJob(typ, hostID, jobID string) {
 		for i := 0; i < job.restarts-1; i++ {
 			duration *= 2
 		}
-		job.timer = timeAfterFunc(duration, func() {
+		job.timer = time.AfterFunc(duration, func() {
 			f.restart(job)
 		})
 	}
