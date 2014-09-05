@@ -399,6 +399,16 @@ type httpService struct {
 func (s *httpService) Pause() {
 	s.pauseMtx.Lock()
 	s.paused = true
+	all := true
+	for _, n := range s.requests {
+		if n != 0 {
+			all = false
+			break
+		}
+	}
+	if all {
+		s.sendEvent("all")
+	}
 	s.pauseMtx.Unlock()
 }
 
