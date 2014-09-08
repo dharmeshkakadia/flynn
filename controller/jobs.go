@@ -424,7 +424,7 @@ func killJob(app *ct.App, params martini.Params, client cluster.Host, r Response
 	}
 }
 
-func runJob(app *ct.App, newJob ct.NewJob, releases *ReleaseRepo, artifacts *ArtifactRepo, cl clusterClient, req *http.Request, w http.ResponseWriter, r ResponseHelper) {
+func runJob(app *ct.App, newJob ct.NewJob, releases *ReleaseRepo, artifacts *ArtifactRepo, jobs *JobRepo, cl clusterClient, req *http.Request, w http.ResponseWriter, r ResponseHelper) {
 	data, err := releases.Get(newJob.ReleaseID)
 	if err != nil {
 		r.Error(err)
@@ -446,7 +446,7 @@ func runJob(app *ct.App, newJob ct.NewJob, releases *ReleaseRepo, artifacts *Art
 	for k, v := range newJob.Env {
 		env[k] = v
 	}
-	job := &host.Job{
+	config := &host.Job{
 		ID: cluster.RandomJobID(""),
 		Metadata: map[string]string{
 			"flynn-controller.app":      app.ID,
@@ -465,7 +465,7 @@ func runJob(app *ct.App, newJob ct.NewJob, releases *ReleaseRepo, artifacts *Art
 		},
 	}
 	if len(newJob.Entrypoint) > 0 {
-		job.Config.Entrypoint = newJob.Entrypoint
+		config.Config.Entrypoint = newJob.Entrypoint
 	}
 
 	hosts, err := cl.ListHosts()
@@ -486,7 +486,7 @@ func runJob(app *ct.App, newJob ct.NewJob, releases *ReleaseRepo, artifacts *Art
 	var attachClient cluster.AttachClient
 	if attach {
 		attachReq := &host.AttachReq{
-			JobID:  job.ID,
+			JobID:  config.ID,
 			Flags:  host.AttachFlagStdout | host.AttachFlagStderr | host.AttachFlagStdin | host.AttachFlagStream,
 			Height: uint16(newJob.Lines),
 			Width:  uint16(newJob.Columns),
@@ -505,7 +505,15 @@ func runJob(app *ct.App, newJob ct.NewJob, releases *ReleaseRepo, artifacts *Art
 		defer attachClient.Close()
 	}
 
-	_, err = cl.AddJobs(&host.AddJobsReq{HostJobs: map[string][]*host.Job{hostID: {job}}})
+	job := &ct.Job{
+		ID:        hostID + "-" + config.ID,
+		AppID:     app.ID,
+		ReleaseID: newJob.ReleaseID,
+		Cmd:       newJob.Cmd,
+	}
+	go watchJob(cl, jobs, job)
+
+	_, err = cl.AddJobs(&host.AddJobsReq{HostJobs: map[string][]*host.Job{hostID: {config}}})
 	if err != nil {
 		r.Error(fmt.Errorf("schedule failed: %s", err.Error()))
 		return
@@ -537,10 +545,37 @@ func runJob(app *ct.App, newJob ct.NewJob, releases *ReleaseRepo, artifacts *Art
 
 		return
 	} else {
-		r.JSON(200, &ct.Job{
-			ID:        hostID + "-" + job.ID,
-			ReleaseID: newJob.ReleaseID,
-			Cmd:       newJob.Cmd,
-		})
+		r.JSON(200, job)
+	}
+}
+
+func watchJob(cl clusterClient, jobs *JobRepo, job *ct.Job) {
+	hostID, jobID := parseJobID(job.ID)
+
+	client, err := cl.DialHost(hostID)
+	if err != nil {
+		return
+	}
+	defer client.Close()
+
+	ch := make(chan *host.Event)
+	stream := client.StreamEvents(jobID, ch)
+	defer stream.Close()
+
+	for event := range ch {
+		switch event.Event {
+		case "create":
+			job.State = "starting"
+		case "start":
+			job.State = "up"
+		case "stop":
+			job.State = "down"
+		case "error":
+			job.State = "crashed"
+		}
+		jobs.Add(job)
+		if job.State == "down" || job.State == "crashed" {
+			return
+		}
 	}
 }
