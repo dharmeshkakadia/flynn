@@ -155,7 +155,10 @@ func (s *HTTPListener) PauseService(name string, pause bool) error {
 	if s.closed {
 		return ErrClosed
 	}
-	service := s.services[name]
+	service, ok := s.services[name]
+	if !ok {
+		return nil
+	}
 	service.paused = pause
 	return nil
 }
